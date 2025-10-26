@@ -1,0 +1,44 @@
+# This file describes a ComfyUI custom node package that bundles
+# everything necessary to train LoRA adapters for the ACE‑Step model.
+# The [project] section contains standard Python packaging metadata
+# and declares runtime dependencies.  The [tool.comfy] section
+# registers the package with ComfyUI's custom node registry and
+# exposes the human‑friendly name shown in the UI.  See the ComfyUI
+# documentation for details about each field.
+
+[project]
+name = "ace-step-lora-trainer"
+description = "ComfyUI custom nodes for training LoRA adapters with the ACE‑Step model."
+version = "0.1.0"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+# Add any additional URLs if you publish this to GitHub or elsewhere.
+urls = {"Repository" = "https://github.com/ace-step/ACE-Step"}
+
+# Minimal dependencies needed to run the training script.  These
+# libraries are already present in most ComfyUI installations, but
+# listing them here makes the package self‑describing.  You can
+# adjust versions as required.
+dependencies = [
+  "datasets>=2.14.0",
+  "pytorch-lightning>=2.0.0",
+  "transformers>=4.30.0",
+  "peft>=0.5.0",
+  "torchaudio>=2.1.0",
+  "diffusers>=0.21.0",
+  "loguru>=0.7.0",
+  "tqdm>=4.65.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.comfy]
+# PublisherId identifies who maintains this node package.  It can be
+# any unique string; if you publish your own nodes you should use
+# something stable like your GitHub username.  The DisplayName is
+# shown in the ComfyUI manager.
+PublisherId = "ace-step"
+DisplayName = "ACE‑Step LoRA Trainer"
+Icon = ""

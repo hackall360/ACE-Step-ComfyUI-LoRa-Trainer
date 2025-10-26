@@ -1,0 +1,12 @@
+# Dependencies required to run the ACE‑Step training scripts.  The
+# packages listed here mirror those declared in pyproject.toml.  If
+# your environment already satisfies these requirements you may
+# omit installation.
+datasets>=2.14.0
+pytorch-lightning>=2.0.0
+transformers>=4.30.0
+peft>=0.5.0
+torchaudio>=2.1.0
+diffusers>=0.21.0
+loguru>=0.7.0
+tqdm>=4.65.0
