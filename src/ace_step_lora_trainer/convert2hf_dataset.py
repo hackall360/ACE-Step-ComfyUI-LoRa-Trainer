@@ -4,37 +4,27 @@
 # saved to disk.  It is provided here so that users can run the
 # conversion independently of ComfyUI if desired.
 
-from datasets import Dataset
-from pathlib import Path
-import os
 import argparse
+from pathlib import Path
 
-def create_dataset(data_dir: str = "./data", repeat_count: int = 2000, output_name: str = "zh_lora_dataset"):
-    data_path = Path(data_dir)
-    all_examples = []
-    for song_path in data_path.glob("*.mp3"):
-        prompt_path = str(song_path).replace(".mp3", "_prompt.txt")
-        lyric_path = str(song_path).replace(".mp3", "_lyrics.txt")
-        try:
-            assert os.path.exists(prompt_path), f"Prompt file {prompt_path} does not exist."
-            assert os.path.exists(lyric_path), f"Lyrics file {lyric_path} does not exist."
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                prompt = f.read().strip()
-            with open(lyric_path, "r", encoding="utf-8") as f:
-                lyrics = f.read().strip()
-            keys = song_path.stem
-            example = {
-                "keys": keys,
-                "filename": str(song_path),
-                "tags": prompt.split(", "),
-                "speaker_emb_path": "",
-                "norm_lyrics": lyrics,
-                "recaption": {},
-            }
-            all_examples.append(example)
-        except AssertionError:
-            continue
-    ds = Dataset.from_list(all_examples * repeat_count)
+from datasets import Dataset
+
+try:  # pragma: no cover - defensive import for standalone execution
+    from .dataset_utils import collect_examples, repeat_examples
+except ImportError:  # pragma: no cover
+    from dataset_utils import collect_examples, repeat_examples
+
+
+def create_dataset(
+    data_dir: str = "./data",
+    repeat_count: int = 2000,
+    output_name: str = "zh_lora_dataset",
+):
+    """Create a HuggingFace dataset that mirrors the official tooling."""
+
+    examples = collect_examples(Path(data_dir))
+    payload = repeat_examples(examples, repeat_count)
+    ds = Dataset.from_list(payload)
     ds.save_to_disk(output_name)
 
 def main():

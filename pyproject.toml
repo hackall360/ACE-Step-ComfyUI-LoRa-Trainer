@@ -27,6 +27,7 @@ dependencies = [
   "torchaudio>=2.1.0",
   "diffusers>=0.21.0",
   "loguru>=0.7.0",
+  "safetensors>=0.3.2",
   "tqdm>=4.65.0",
 ]
 

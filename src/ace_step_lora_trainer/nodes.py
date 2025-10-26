@@ -1,4 +1,4 @@
-# Copyright 2025 The ACE‑Step Authors.
+# Copyright 2025 The ACE-Step Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,75 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-ComfyUI custom nodes for training Low‑Rank Adaptation (LoRA) adapters with
-ACE‑Step models.
+"""ComfyUI custom nodes that mirror the ACE-Step LoRA training workflow.
 
-This module exposes two nodes:
-
-* ``AceStepDatasetConverter`` converts a directory of MP3 files along
-  with ``*_prompt.txt`` and ``*_lyrics.txt`` metadata into a
-  HuggingFace dataset on disk【647056671281071†L2-L31】.  The logic mirrors
-  the `convert2hf_dataset.py` script from the ACE‑Step repository【864267642857010†L4-L38】.
-
-* ``AceStepLoRaTrainer`` launches the bundled `trainer.py` script to
-  fine‑tune LoRA adapters for ACE‑Step.  All of the hyper‑parameters
-  documented in ``TRAIN_INSTRUCTION.md`` are exposed as node inputs
-  so that you can configure training from within ComfyUI【647056671281071†L139-L193】.
-
-Both nodes follow the conventions required by ComfyUI: a class
-variable ``CATEGORY`` specifying where the node appears in the UI, an
-``INPUT_TYPES`` class method describing input widgets, a
-``RETURN_TYPES`` tuple naming the return value types, and a
-``FUNCTION`` string indicating which method implements the node's
-behaviour【529967675490930†L165-L171】.
+The official ACE-Step LoRA training guide explains how to prepare data,
+configure LoRA adapters and run the training loop【647056671281071†L2-L193】.
+This module provides dedicated nodes for each step so that the entire
+process can be orchestrated inside a ComfyUI workflow.  Every node follows
+ComfyUI's conventions – ``CATEGORY`` determines where the node appears in
+the UI, ``INPUT_TYPES`` describes the widgets, ``RETURN_TYPES`` names the
+outputs and ``FUNCTION`` points at the implementation method【529967675490930†L165-L171】.
 """
 
 from __future__ import annotations
 
-import os
+import json
+import shutil
 import subprocess
+import tarfile
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
+
+import torch
+from datasets import Dataset, concatenate_datasets, load_from_disk
+from safetensors.torch import save_file as save_safetensors
+
+from .dataset_utils import collect_examples, repeat_examples
 
 
 class AceStepDatasetConverter:
-    """
-    Convert a directory of MP3 files and corresponding prompt/lyrics files
-    into a HuggingFace dataset on disk.
+    """Convert raw ACE-Step training triples into a HuggingFace dataset."""
 
-    The converter expects a directory where each audio sample contains three
-    files: ``filename.mp3``, ``filename_prompt.txt`` and
-    ``filename_lyrics.txt``【647056671281071†L2-L31】.  The ``_prompt.txt``
-    files should contain comma‑separated audio tags describing the track,
-    and the ``_lyrics.txt`` files should contain the song lyrics.  The
-    resulting dataset will be repeated ``repeat_count`` times and saved to
-    ``output_name`` as a HuggingFace dataset【864267642857010†L4-L38】.
-    """
-
-    CATEGORY = "ACE‑Step/Training"
+    CATEGORY = "ACE-Step/Data"
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple]]:
-        """
-        Define the inputs for the dataset conversion node.
-
-        * ``data_dir`` – a string path to the directory containing audio data.
-        * ``repeat_count`` – an integer specifying how many times to repeat the
-          dataset.  Repeating small datasets helps balance the number of
-          training steps.
-        * ``output_name`` – the directory name where the dataset will be
-          written.
-
-        All inputs are required.
-        """
         return {
             "required": {
                 "data_dir": (
                     "STRING",
                     {
                         "default": "./data",
-                        "placeholder": "Path to directory of MP3, prompt and lyrics files",
+                        "placeholder": "Directory of *.mp3 + _prompt/_lyrics files",
                     },
                 ),
                 "repeat_count": (
@@ -95,107 +67,330 @@ class AceStepDatasetConverter:
                 "output_name": (
                     "STRING",
                     {
-                        "default": "zh_lora_dataset",
-                        "placeholder": "Name of the output HuggingFace dataset directory",
+                        "default": "./zh_lora_dataset",
+                        "placeholder": "Destination directory for the dataset",
                     },
                 ),
-            },
+            }
         }
 
     RETURN_TYPES = ("STRING",)
     FUNCTION = "convert"
 
     def convert(self, data_dir: str, repeat_count: int, output_name: str) -> Tuple[str]:
-        """
-        Perform dataset conversion.  This method walks the ``data_dir``
-        directory looking for MP3 files and their associated prompt/lyrics
-        files, builds a list of examples, repeats the list ``repeat_count``
-        times, and writes a HuggingFace dataset to ``output_name``【864267642857010†L4-L38】.
-
-        Parameters
-        ----------
-        data_dir:
-            Directory containing ``*.mp3``, ``*_prompt.txt`` and
-            ``*_lyrics.txt`` files.
-        repeat_count:
-            Number of times to repeat the dataset.
-        output_name:
-            Name of the output directory for the HuggingFace dataset.
-
-        Returns
-        -------
-        tuple[str]:
-            A tuple containing the path to the created dataset.
-        """
-        # Import datasets lazily to avoid pulling in the dependency if the
-        # converter node is never executed.
-        from datasets import Dataset  # type: ignore
-
         data_path = Path(data_dir)
-        if not data_path.exists() or not data_path.is_dir():
-            raise ValueError(
-                f"Data directory '{data_dir}' does not exist or is not a directory."
-            )
-
-        all_examples = []
-        for song_path in data_path.glob("*.mp3"):
-            prompt_path = song_path.with_suffix("").as_posix() + "_prompt.txt"
-            lyric_path = song_path.with_suffix("").as_posix() + "_lyrics.txt"
-            if not os.path.exists(prompt_path) or not os.path.exists(lyric_path):
-                continue
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                prompt = f.read().strip()
-            with open(lyric_path, "r", encoding="utf-8") as f:
-                lyrics = f.read().strip()
-
-            example = {
-                "keys": song_path.stem,
-                "filename": str(song_path),
-                "tags": [tag.strip() for tag in prompt.split(",")],
-                "speaker_emb_path": "",
-                "norm_lyrics": lyrics,
-                "recaption": {},
-            }
-            all_examples.append(example)
-
-        if not all_examples:
-            raise ValueError(
-                f"No valid samples found in '{data_dir}'. "
-                "Ensure files follow the naming convention described in the training documentation."
-            )
-
-        dataset = Dataset.from_list(all_examples * int(repeat_count))
+        examples = collect_examples(data_path)
+        payload = repeat_examples(examples, repeat_count)
+        dataset = Dataset.from_list(payload)
         dataset.save_to_disk(output_name)
-        return (output_name,)
+        return (str(Path(output_name).resolve()),)
+
+
+class AceStepDatasetUpdater:
+    """Append new samples to an existing ACE-Step dataset on disk."""
+
+    CATEGORY = "ACE-Step/Data"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple]]:
+        return {
+            "required": {
+                "dataset_path": (
+                    "STRING",
+                    {
+                        "default": "./zh_lora_dataset",
+                        "placeholder": "Existing HuggingFace dataset path",
+                    },
+                ),
+                "new_data_dir": (
+                    "STRING",
+                    {
+                        "default": "./new_data",
+                        "placeholder": "Directory containing additional MP3/prompt/lyric triples",
+                    },
+                ),
+                "repeat_count": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 1_000_000,
+                        "step": 1,
+                    },
+                ),
+            },
+            "optional": {
+                "create_backup": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Copy the dataset before applying updates",
+                    },
+                ),
+                "backup_dir": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "placeholder": "Optional directory for the backup copy",
+                    },
+                ),
+                "overwrite_backup": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Replace an existing backup directory if it exists",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    FUNCTION = "update_dataset"
+
+    def update_dataset(
+        self,
+        dataset_path: str,
+        new_data_dir: str,
+        repeat_count: int,
+        create_backup: bool = True,
+        backup_dir: str = "",
+        overwrite_backup: bool = False,
+    ) -> Tuple[str, int]:
+        dataset_dir = Path(dataset_path)
+        if not dataset_dir.exists():
+            raise FileNotFoundError(
+                f"Dataset path '{dataset_path}' does not exist. Run the converter first."
+            )
+
+        if create_backup:
+            backup_path = Path(backup_dir) if backup_dir else dataset_dir.with_name(dataset_dir.name + ".bak")
+            if backup_path.exists():
+                if not overwrite_backup:
+                    raise FileExistsError(
+                        f"Backup directory '{backup_path}' already exists. Enable overwrite to replace it."
+                    )
+                shutil.rmtree(backup_path)
+            shutil.copytree(dataset_dir, backup_path)
+
+        existing_dataset = load_from_disk(str(dataset_dir))
+        new_examples = collect_examples(Path(new_data_dir))
+        payload = repeat_examples(new_examples, repeat_count)
+        additional = Dataset.from_list(payload)
+        merged = concatenate_datasets([existing_dataset, additional])
+        merged.save_to_disk(str(dataset_dir))
+        return (str(dataset_dir.resolve()), len(payload))
+
+
+class AceStepDatasetArchiver:
+    """Create a tar archive of a HuggingFace dataset directory."""
+
+    CATEGORY = "ACE-Step/Data"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple]]:
+        return {
+            "required": {
+                "dataset_path": (
+                    "STRING",
+                    {
+                        "default": "./zh_lora_dataset",
+                        "placeholder": "Dataset directory to archive",
+                    },
+                ),
+                "archive_path": (
+                    "STRING",
+                    {
+                        "default": "./archives/zh_lora_dataset.tar.gz",
+                        "placeholder": "Destination archive path",
+                    },
+                ),
+            },
+            "optional": {
+                "compression": (
+                    (["gz", "bz2", "xz", "none"],),
+                    {
+                        "default": "gz",
+                        "tooltip": "Compression algorithm for the tar archive",
+                    },
+                ),
+                "create_parents": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Create parent directories if they do not exist",
+                    },
+                ),
+                "overwrite": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Replace the archive if it already exists",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "archive_dataset"
+
+    def archive_dataset(
+        self,
+        dataset_path: str,
+        archive_path: str,
+        compression: str = "gz",
+        create_parents: bool = True,
+        overwrite: bool = False,
+    ) -> Tuple[str]:
+        dataset_dir = Path(dataset_path)
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"Dataset path '{dataset_path}' does not exist")
+
+        archive_file = Path(archive_path)
+        if archive_file.exists():
+            if overwrite:
+                archive_file.unlink()
+            else:
+                raise FileExistsError(
+                    f"Archive '{archive_file}' already exists. Enable overwrite to replace it."
+                )
+
+        if create_parents:
+            archive_file.parent.mkdir(parents=True, exist_ok=True)
+
+        mode = {
+            "gz": "w:gz",
+            "bz2": "w:bz2",
+            "xz": "w:xz",
+            "none": "w",
+        }[compression]
+
+        with tarfile.open(archive_file, mode) as tar:
+            tar.add(dataset_dir, arcname=dataset_dir.name)
+
+        return (str(archive_file.resolve()),)
+
+
+class AceStepLoRaConfigBuilder:
+    """Create a PEFT-compatible LoRA configuration JSON file."""
+
+    CATEGORY = "ACE-Step/Config"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple]]:
+        return {
+            "required": {
+                "output_path": (
+                    "STRING",
+                    {
+                        "default": "./config/ace_step_lora_config.json",
+                        "placeholder": "Location to save the config JSON",
+                    },
+                ),
+                "rank": (
+                    "INT",
+                    {
+                        "default": 64,
+                        "min": 1,
+                        "max": 2048,
+                        "step": 1,
+                    },
+                ),
+                "alpha": (
+                    "INT",
+                    {
+                        "default": 64,
+                        "min": 1,
+                        "max": 4096,
+                        "step": 1,
+                    },
+                ),
+                "dropout": (
+                    "FLOAT",
+                    {
+                        "default": 0.05,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                    },
+                ),
+            },
+            "optional": {
+                "bias": (
+                    (["none", "all", "lora_only"],),
+                    {
+                        "default": "none",
+                        "tooltip": "Bias handling strategy used by PEFT",
+                    },
+                ),
+                "task_type": (
+                    ([
+                        "AUDIO_GENERATION",
+                        "AUDIO_CLASSIFICATION",
+                        "SEQ_2_SEQ_LM",
+                        "CAUSAL_LM",
+                    ],),
+                    {
+                        "default": "AUDIO_GENERATION",
+                        "tooltip": "Task type embedded in the config",
+                    },
+                ),
+                "target_modules": (
+                    "STRING",
+                    {
+                        "default": "to_q,to_k,to_v,to_out.0",
+                        "placeholder": "Comma separated module names",
+                    },
+                ),
+                "modules_to_save": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "placeholder": "Optional comma separated modules to keep in full precision",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "build_config"
+
+    def build_config(
+        self,
+        output_path: str,
+        rank: int,
+        alpha: int,
+        dropout: float,
+        bias: str = "none",
+        task_type: str = "AUDIO_GENERATION",
+        target_modules: str = "to_q,to_k,to_v,to_out.0",
+        modules_to_save: str = "",
+    ) -> Tuple[str]:
+        config_path = Path(output_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config: Dict[str, Any] = {
+            "r": int(rank),
+            "lora_alpha": int(alpha),
+            "lora_dropout": float(dropout),
+            "bias": bias,
+            "task_type": task_type,
+            "target_modules": [module.strip() for module in target_modules.split(",") if module.strip()],
+        }
+        modules = [module.strip() for module in modules_to_save.split(",") if module.strip()]
+        if modules:
+            config["modules_to_save"] = modules
+
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        return (str(config_path.resolve()),)
 
 
 class AceStepLoRaTrainer:
-    """
-    Train a Low‑Rank Adaptation (LoRA) adapter for ACE‑Step.
+    """Launch the bundled ACE-Step ``trainer.py`` script."""
 
-    This node wraps the ``trainer.py`` script included in this package
-    and exposes its many command‑line arguments as inputs so that
-    training can be configured from within a ComfyUI workflow【647056671281071†L139-L193】.
-    The training parameters mirror those described in the ACE‑Step
-    training instructions.
-
-    When executed, this node launches the trainer as a subprocess.
-    Training progress and checkpoints will be written to the directories
-    specified by ``logger_dir`` and ``checkpoint_dir``.  The return
-    value is a simple string indicating completion; if an error occurs
-    during training it will be raised so that ComfyUI can report it to
-    the user.
-    """
-
-    CATEGORY = "ACE‑Step/Training"
+    CATEGORY = "ACE-Step/Training"
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
-        """
-        Define the required and optional inputs for the LoRA trainer node.
-        Each entry corresponds to a command‑line argument of ``trainer.py``
-        described in the ACE‑Step documentation【647056671281071†L139-L193】.
-        """
         return {
             "required": {
                 "dataset_path": (
@@ -216,14 +411,14 @@ class AceStepLoRaTrainer:
                     "STRING",
                     {
                         "default": "ace_step_lora",
-                        "placeholder": "Experiment name",
+                        "placeholder": "Experiment name (used for logging)",
                     },
                 ),
                 "trainer_script": (
                     "STRING",
                     {
                         "default": "trainer.py",
-                        "placeholder": "Path to ACE‑Step trainer.py",
+                        "placeholder": "Path to ACE-Step trainer.py",
                     },
                 ),
                 "learning_rate": (
@@ -241,6 +436,7 @@ class AceStepLoRaTrainer:
                         "default": 8,
                         "min": 0,
                         "max": 256,
+                        "step": 1,
                     },
                 ),
                 "epochs": (
@@ -249,6 +445,7 @@ class AceStepLoRaTrainer:
                         "default": -1,
                         "min": -1,
                         "max": 10_000,
+                        "step": 1,
                     },
                 ),
                 "max_steps": (
@@ -257,6 +454,7 @@ class AceStepLoRaTrainer:
                         "default": 2_000_000,
                         "min": 1,
                         "max": 10_000_000,
+                        "step": 1,
                     },
                 ),
                 "every_n_train_steps": (
@@ -265,6 +463,7 @@ class AceStepLoRaTrainer:
                         "default": 2_000,
                         "min": 1,
                         "max": 1_000_000,
+                        "step": 1,
                     },
                 ),
             },
@@ -275,6 +474,7 @@ class AceStepLoRaTrainer:
                         "default": 1,
                         "min": 1,
                         "max": 128,
+                        "step": 1,
                     },
                 ),
                 "shift": (
@@ -290,7 +490,7 @@ class AceStepLoRaTrainer:
                     (["32", "16", "bf16"],),
                     {
                         "default": "32",
-                        "tooltip": "Floating‑point precision. 32 for FP32, 16 for FP16 or bf16",
+                        "tooltip": "Floating point precision for PyTorch Lightning",
                     },
                 ),
                 "accumulate_grad_batches": (
@@ -299,6 +499,7 @@ class AceStepLoRaTrainer:
                         "default": 1,
                         "min": 1,
                         "max": 256,
+                        "step": 1,
                     },
                 ),
                 "gradient_clip_val": (
@@ -322,20 +523,21 @@ class AceStepLoRaTrainer:
                         "default": 1,
                         "min": 1,
                         "max": 16,
+                        "step": 1,
                     },
                 ),
                 "logger_dir": (
                     "STRING",
                     {
                         "default": "./exps/logs/",
-                        "placeholder": "Directory to write training logs",
+                        "placeholder": "Directory to write TensorBoard logs and checkpoints",
                     },
                 ),
                 "ckpt_path": (
                     "STRING",
                     {
                         "default": "",
-                        "placeholder": "Resume checkpoint path (optional)",
+                        "placeholder": "Optional checkpoint to resume from",
                     },
                 ),
                 "checkpoint_dir": (
@@ -351,6 +553,7 @@ class AceStepLoRaTrainer:
                         "default": 1,
                         "min": 1,
                         "max": 1000,
+                        "step": 1,
                     },
                 ),
                 "every_plot_step": (
@@ -359,6 +562,7 @@ class AceStepLoRaTrainer:
                         "default": 2000,
                         "min": 1,
                         "max": 10_000_000,
+                        "step": 1,
                     },
                 ),
                 "val_check_interval": (
@@ -367,14 +571,15 @@ class AceStepLoRaTrainer:
                         "default": 0,
                         "min": 0,
                         "max": 1_000_000,
-                        "tooltip": "Number of steps between validations (0 disables periodic validation)",
+                        "step": 1,
+                        "tooltip": "Number of steps between validation runs (0 disables periodic validation)",
                     },
                 ),
                 "adapter_name": (
                     "STRING",
                     {
                         "default": "lora_adapter",
-                        "placeholder": "Name of the new LoRA adapter",
+                        "placeholder": "Name used when saving the adapter",
                     },
                 ),
             },
@@ -409,17 +614,7 @@ class AceStepLoRaTrainer:
         val_check_interval: int = 0,
         adapter_name: str = "lora_adapter",
     ) -> Tuple[str]:
-        """
-        Launch the ACE‑Step LoRA trainer as a subprocess.  All parameters map
-        directly onto the command‑line flags of ``trainer.py``【647056671281071†L139-L193】.
-
-        Returns
-        -------
-        tuple[str]:
-            A tuple containing a status message indicating where logs or
-            checkpoints have been written.
-        """
-        cmd = ["python", trainer_script]
+        cmd: List[str] = ["python", trainer_script]
         cmd += ["--num_nodes", str(num_nodes)]
         cmd += ["--shift", str(shift)]
         cmd += ["--learning_rate", str(learning_rate)]
@@ -441,15 +636,11 @@ class AceStepLoRaTrainer:
             cmd += ["--checkpoint_dir", checkpoint_dir]
         cmd += ["--reload_dataloaders_every_n_epochs", str(reload_dataloaders_every_n_epochs)]
         cmd += ["--every_plot_step", str(every_plot_step)]
-        if val_check_interval and int(val_check_interval) > 0:
+        if val_check_interval:
             cmd += ["--val_check_interval", str(val_check_interval)]
         cmd += ["--lora_config_path", lora_config_path]
         cmd += ["--adapter_name", adapter_name]
 
-        # Resolve the trainer script path.  If the provided path is
-        # relative and does not exist, attempt to find it alongside this
-        # nodes file.  This allows packaging the script within this
-        # module.
         script_path = Path(trainer_script)
         if not script_path.exists():
             candidate = Path(__file__).parent / trainer_script
@@ -469,41 +660,144 @@ class AceStepLoRaTrainer:
             text=True,
         )
 
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-        for stdout_line in process.stdout:
-            stdout_lines.append(stdout_line.rstrip())
+        stdout_lines: List[str] = []
+        stderr_lines: List[str] = []
+        for line in process.stdout:
+            stdout_lines.append(line.rstrip())
         _, remaining_err = process.communicate()
         if remaining_err:
             stderr_lines.append(remaining_err)
-        return_code = process.returncode
-        if return_code != 0:
+
+        if process.returncode != 0:
             error_message = "\n".join(stderr_lines) if stderr_lines else "Unknown error"
             raise RuntimeError(
-                f"ACE‑Step training failed with exit code {return_code}.\n{error_message}"
+                f"ACE-Step training failed with exit code {process.returncode}.\n{error_message}"
             )
 
         status = (
-            f"ACE‑Step LoRA training complete.  Logs written to '{logger_dir}'. "
+            f"ACE-Step LoRA training complete. Logs written to '{logger_dir}'. "
             f"Checkpoints saved to '{checkpoint_dir or 'default checkpoint directory'}'."
         )
         return (status,)
 
 
-# Register nodes with ComfyUI
+class AceStepLoRaCheckpointExporter:
+    """Export the LoRA adapter saved during training for deployment."""
+
+    CATEGORY = "ACE-Step/Training"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Tuple]]:
+        return {
+            "required": {
+                "checkpoint_dir": (
+                    "STRING",
+                    {
+                        "default": "./exps/logs/latest/checkpoints/epoch=0-step=0_lora",
+                        "placeholder": "Directory containing adapter_config.json and adapter_model.bin",
+                    },
+                ),
+                "output_dir": (
+                    "STRING",
+                    {
+                        "default": "./exports/ace_step_lora",
+                        "placeholder": "Where to copy or convert the adapter",
+                    },
+                ),
+            },
+            "optional": {
+                "format": (
+                    (["peft", "safetensors"],),
+                    {
+                        "default": "safetensors",
+                        "tooltip": "Keep the PEFT .bin weights or convert to safetensors",
+                    },
+                ),
+                "overwrite": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Replace files in the output directory if they already exist",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    FUNCTION = "export_adapter"
+
+    def export_adapter(
+        self,
+        checkpoint_dir: str,
+        output_dir: str,
+        format: str = "safetensors",
+        overwrite: bool = False,
+    ) -> Tuple[str, str]:
+        source = Path(checkpoint_dir)
+        if not source.exists() or not source.is_dir():
+            raise FileNotFoundError(
+                f"Checkpoint directory '{checkpoint_dir}' does not exist or is not a directory."
+            )
+
+        adapter_config = source / "adapter_config.json"
+        adapter_weights = source / "adapter_model.bin"
+        if not adapter_config.exists() or not adapter_weights.exists():
+            raise FileNotFoundError(
+                "The checkpoint directory does not contain 'adapter_config.json' and 'adapter_model.bin'. "
+                "Ensure you point to the LoRA adapter folder produced during training."
+            )
+
+        destination = Path(output_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+
+        config_target = destination / "adapter_config.json"
+        if config_target.exists() and not overwrite:
+            raise FileExistsError(f"'{config_target}' already exists. Enable overwrite to replace it.")
+        shutil.copy2(adapter_config, config_target)
+
+        if format == "peft":
+            weights_target = destination / "adapter_model.bin"
+            if weights_target.exists() and not overwrite:
+                raise FileExistsError(f"'{weights_target}' already exists. Enable overwrite to replace it.")
+            shutil.copy2(adapter_weights, weights_target)
+        else:
+            weights_target = destination / "adapter_model.safetensors"
+            if weights_target.exists() and not overwrite:
+                raise FileExistsError(
+                    f"'{weights_target}' already exists. Enable overwrite to replace it."
+                )
+            state_dict = torch.load(adapter_weights, map_location="cpu")
+            save_safetensors(state_dict, str(weights_target))
+
+        return (str(destination.resolve()), str(weights_target.resolve()))
+
+
 NODE_CLASS_MAPPINGS = {
-    "ACE‑Step Dataset Converter": AceStepDatasetConverter,
-    "ACE‑Step LoRA Trainer": AceStepLoRaTrainer,
+    "ACE-Step Dataset Converter": AceStepDatasetConverter,
+    "ACE-Step Dataset Updater": AceStepDatasetUpdater,
+    "ACE-Step Dataset Archiver": AceStepDatasetArchiver,
+    "ACE-Step LoRA Config Builder": AceStepLoRaConfigBuilder,
+    "ACE-Step LoRA Trainer": AceStepLoRaTrainer,
+    "ACE-Step LoRA Exporter": AceStepLoRaCheckpointExporter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ACE‑Step Dataset Converter": "ACE‑Step: Create Dataset",
-    "ACE‑Step LoRA Trainer": "ACE‑Step: Train LoRA",
+    "ACE-Step Dataset Converter": "ACE-Step: Create Dataset",
+    "ACE-Step Dataset Updater": "ACE-Step: Update Dataset",
+    "ACE-Step Dataset Archiver": "ACE-Step: Archive Dataset",
+    "ACE-Step LoRA Config Builder": "ACE-Step: Build LoRA Config",
+    "ACE-Step LoRA Trainer": "ACE-Step: Train LoRA",
+    "ACE-Step LoRA Exporter": "ACE-Step: Export LoRA",
 }
 
 __all__ = [
+    "AceStepDatasetArchiver",
     "AceStepDatasetConverter",
+    "AceStepDatasetUpdater",
+    "AceStepLoRaCheckpointExporter",
+    "AceStepLoRaConfigBuilder",
     "AceStepLoRaTrainer",
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
 ]
+
